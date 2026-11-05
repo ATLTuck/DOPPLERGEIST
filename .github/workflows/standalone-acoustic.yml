@@ -1,0 +1,41 @@
+name: Standalone acoustic slice
+on:
+  push:
+    paths: ['native/acoustic/**', 'src/dopplergeist/_native_acoustic.c', '.github/workflows/standalone-acoustic.yml']
+  pull_request:
+    paths: ['native/acoustic/**', 'src/dopplergeist/_native_acoustic.c', '.github/workflows/standalone-acoustic.yml']
+permissions:
+  contents: read
+jobs:
+  real-trajectory-parity:
+    runs-on: ubuntu-latest
+    env:
+      CGO_CFLAGS_ALLOW: '-ffp-contract=off'
+      PYTHONPATH: src
+      DG_ACOUSTIC_BIN: /tmp/dg-acoustic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build standalone C and check C++ compilation
+        run: |
+          gcc -O3 -ffp-contract=off -fno-fast-math -fPIC -shared native/acoustic/core.c -lm -o /tmp/libdg_c.so
+          g++ -x c++ -std=c++17 -O3 -ffp-contract=off -fno-fast-math -fPIC -shared native/acoustic/core.c -lm -o /tmp/libdg_cpp.so
+      - name: Go real golden checks and CLI
+        working-directory: native/acoustic
+        run: |
+          go test -race ./...
+          go build -o /tmp/dg-acoustic ./cmd/dg-acoustic
+      - name: Build unchanged native reference
+        run: |
+          python -m pip install numpy scipy pandas pyproj pytest setuptools
+          python setup.py build_ext --inplace
+      - name: Real trajectory differential checks only
+        run: |
+          python native/acoustic/tools/verify.py
+          python -m pytest -q tests/test_real_native_acoustic.py
