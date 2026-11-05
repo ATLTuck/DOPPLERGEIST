@@ -126,3 +126,56 @@ func TestConcurrentIndependentSolvers(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestBatchParityAndValidation(t *testing.T) {
+	r := realRequest(t)
+	b, e := NewBatch([]Request{r, r})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer b.Close()
+	if e = b.Solve(); e != nil {
+		t.Fatal(e)
+	}
+	var scalar Solver
+	if e = scalar.Solve(&r); e != nil {
+		t.Fatal(e)
+	}
+	for _, v := range b.Results() {
+		for i, x := range v.Factor {
+			if math.Float64bits(x) != math.Float64bits(scalar.Factor[i]) {
+				t.Fatal("batch differs")
+			}
+		}
+	}
+	// Array mutations are revalidated on every call, not just at preparation.
+	original := r.Knots[1]
+	r.Knots[1] = r.Knots[0]
+	if b.Solve() == nil {
+		t.Fatal("batch skipped validation")
+	}
+	r.Knots[1] = original
+	if e = b.Solve(); e != nil {
+		t.Fatal(e)
+	}
+	if n := testing.AllocsPerRun(100, func() {
+		if e := b.Solve(); e != nil {
+			panic(e)
+		}
+	}); n != 0 {
+		t.Fatalf("batch allocated %v", n)
+	}
+	b.Close()
+	if b.Solve() == nil {
+		t.Fatal("used closed batch")
+	}
+}
+func TestBatchEmpty(t *testing.T) {
+	if _, e := NewBatch(nil); e == nil {
+		t.Fatal("accepted empty batch")
+	}
+	var b Batch
+	if b.Solve() == nil {
+		t.Fatal("accepted zero value batch")
+	}
+}

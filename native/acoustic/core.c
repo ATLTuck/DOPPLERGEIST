@@ -188,3 +188,17 @@ int dg_solve(const double *t, size_t n, const double *observer,
  if (fesetenv(&previous)) return DG_INVALID;
  return result ? DG_FALLBACK : DG_OK;
 }
+
+int dg_solve_batch(dg_job *jobs, size_t count) {
+ if (!jobs || !count || count > 4096) return DG_INVALID;
+ int failed = 0;
+ for (size_t i=0; i<count; ++i) {
+  dg_job *j = jobs+i;
+  j->result = dg_solve(j->t,j->n,j->observer,j->p,j->plen,j->x,j->m,
+   j->packed,j->packed_len,j->packed_x,j->pm,j->origin,j->start,j->end,
+   j->c,j->arrival_start,j->arrival_end,j->factor,j->tau,j->distance,
+   j->state,j->state_len);
+  if (j->result != DG_OK) failed = 1;
+ }
+ return failed ? DG_FALLBACK : DG_OK;
+}

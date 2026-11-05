@@ -42,13 +42,19 @@ def cases():
     if not result: raise RuntimeError('no real supported trajectories')
     return result
 
+class Job(ct.Structure):
+    _fields_=list(zip(['t','n','observer','p','plen','x','m','packed','packed_len','packed_x','pm','origin','start','end','c','arrival_start','arrival_end','factor','tau','distance','state','state_len'],[D,ct.c_size_t,D,D,ct.c_size_t,D,ct.c_size_t,D,ct.c_size_t,D,ct.c_size_t]+[ct.c_double]*6+[D,D,D,U,ct.c_size_t]))+[('result',ct.c_int)]
+
 class Kernel:
     def __init__(self, directory):
-        binary = Path(directory)/'libdg.so'
-        subprocess.run(['gcc','-O3','-ffp-contract=off','-fno-fast-math','-shared','-fPIC',str(ROOT/'native/acoustic/core.c'),'-lm','-o',str(binary)],check=True)
+        binary = Path(os.environ.get('DG_ACOUSTIC_LIB', str(Path(directory)/'libdg.so')))
+        if not os.environ.get('DG_ACOUSTIC_LIB'):
+            subprocess.run(['gcc','-O3','-ffp-contract=off','-fno-fast-math','-shared','-fPIC',str(ROOT/'native/acoustic/core.c'),'-lm','-o',str(binary)],check=True)
         self.lib=ct.CDLL(str(binary)); self.solve=self.lib.dg_solve
         self.solve.argtypes=[D,ct.c_size_t,D,D,ct.c_size_t,D,ct.c_size_t,D,ct.c_size_t,D,ct.c_size_t]+[ct.c_double]*6+[D,D,D,U,ct.c_size_t]
         self.solve.restype=ct.c_int
+        self.batch=self.lib.dg_solve_batch
+        self.batch.argtypes=[ct.POINTER(Job),ct.c_size_t];self.batch.restype=ct.c_int
     def prepare(self,args,scalars):
         t,o,p,x,packed,px=args
         output=[np.empty(t.shape) for _ in range(3)]
@@ -85,6 +91,17 @@ class Parity(unittest.TestCase):
         if ok:
             for a,b in zip(expected,actual):
                 self.assertEqual(a.tobytes(),b.tobytes())
+    def test_batch_all_outputs_and_statuses(self):
+        work=[self.kernel.prepare(a,s) for _,a,s,_ in self.cases]
+        jobs=(Job*len(work))(*(Job(*call,0) for out,state,call in work))
+        self.assertEqual(self.kernel.batch(jobs,len(jobs)),0)
+        for (_,a,s,_),(out,state,call) in zip(self.cases,work):
+            status,expected=self.kernel.run(a,s);self.assertEqual(status,0)
+            for x,y in zip(expected,out):self.assertEqual(x.tobytes(),y.tobytes())
+        jobs[0].state_len=0
+        self.assertEqual(self.kernel.batch(jobs,len(jobs)),2)
+        self.assertEqual(jobs[0].result,1)
+        self.assertTrue(all(j.result==0 for j in jobs[1:]))
     def test_real_native_bitwise(self):
         for _,a,s,_ in self.cases:self.compare(a,s)
     def test_boundaries_and_global_stop(self):
@@ -124,11 +141,16 @@ class Parity(unittest.TestCase):
         fixture=json.loads((ROOT/'native/acoustic/real-request.json').read_text())
         r=fixture[0];r['times']=[float(np.nextafter(r['arrival_start'],-np.inf)),r['arrival_start']]
         path=Path(self.tmp.name)/'batch.json';path.write_text(json.dumps([r,r]))
-        output=subprocess.check_output([os.environ['DG_ACOUSTIC_BIN'],'-input',str(path),'-repeat','3'],text=True)
-        result=json.loads(output)
-        self.assertEqual(len(result['results']),2)
-        self.assertIsNone(result['results'][0]['factor'][0])
-        self.assertEqual(result['repeats'],3)
+        outputs=[]
+        for mode in ('scalar','batch'):
+            output=subprocess.check_output([os.environ['DG_ACOUSTIC_BIN'],'-input',str(path),'-repeat','3','-dispatch',mode],text=True)
+            result=json.loads(output)
+            self.assertEqual(len(result['results']),2)
+            self.assertIsNone(result['results'][0]['factor'][0])
+            self.assertEqual(result['repeats'],3)
+            self.assertEqual(result['dispatch'],mode)
+            outputs.append(result['results'])
+        self.assertEqual(outputs[0],outputs[1])
     @unittest.skipUnless(os.environ.get('DG_ACOUSTIC_BIN'), 'set DG_ACOUSTIC_BIN for CLI tests')
     def test_cli_rejects_bad_input(self):
         for text in ('[]', '{}', '[{"unknown":1}]', '[null]', '[] trailing'):
@@ -146,11 +168,15 @@ def benchmark(repeat):
             out,state,call=kernel.prepare(a,s)
             # Keep buffers and ctypes pointers alive outside timer.
             work.append((a,s,out,state,call))
+        jobs=(Job*len(work))(*(Job(*call,0) for a,s,out,state,call in work))
         runs=[]
         for pair in range(3):
-            for backend in (('native_c','standalone') if pair%2==0 else ('standalone','native_c')):
+            for backend in (('native_c','standalone','batch') if pair%2==0 else ('batch','standalone','native_c')):
                 cpu=time.process_time();wall=time.perf_counter()
                 for _ in range(repeat):
+                    if backend=='batch':
+                        if kernel.batch(jobs,len(jobs))!=0:raise RuntimeError('batch fallback')
+                        continue
                     for a,s,out,state,call in work:
                         ok=(native_acoustic._native.solve(*a,*s,*out) if backend=='native_c' else kernel.solve(*call)==0)
                         if not ok:raise RuntimeError('benchmark fallback')
@@ -158,7 +184,14 @@ def benchmark(repeat):
         print(json.dumps(dict(repeat=repeat,trajectories=len(data),samples=sum(len(a[0]) for _,a,_,_ in data),runs=runs),indent=2))
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser();parser.add_argument('--export');parser.add_argument('--benchmark',type=int);args=parser.parse_args()
-    if args.export:export(cases()[0],args.export)
+    parser=argparse.ArgumentParser();parser.add_argument('--export');parser.add_argument('--export-batch');parser.add_argument('--benchmark',type=int);args=parser.parse_args()
+    if args.export_batch:
+        requests=[]
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'request.json'
+            for case in cases():
+                export(case,path);requests.extend(json.loads(path.read_text()))
+        Path(args.export_batch).write_text(json.dumps(requests,allow_nan=False)+'\n')
+    elif args.export:export(cases()[0],args.export)
     elif args.benchmark:benchmark(args.benchmark)
     else:unittest.main(argv=['verify.py'])

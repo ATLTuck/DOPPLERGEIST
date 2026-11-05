@@ -23,7 +23,7 @@ search locations, or produce calibrated confidence.
 - Real archived trajectory differential tests, golden Go checks, allocation test,
   native-C baseline measurement harness, and a separate Linux CI workflow.
 
-C++ compilation is included as a CI build check, **not locally verified**: the box
+C++ compilation **passed on the initial commit in GitHub CI**, but is not locally verified: the box
 had GCC but no C++ compiler. Signed Debian HTTP metadata returned HTTP 500;
 HTTPS apt transport failed TLS. No signature or TLS checks were disabled.
 The tested delivery uses C + Go, as the explicitly authorized fallback. The C ABI
@@ -132,3 +132,80 @@ Required Notice: Copyright 2026 Cinna Davis.
 [PolyForm Noncommercial 1.0.0](../../LICENSE) applies; all upstream notices,
 legacy MIT grants, and third-party/data terms remain intact. A language port does
 not grant commercial rights. No REA code or dependency is used.
+
+## Performance follow-up: batch boundary, not a faster algorithm
+
+`dg_solve_batch` accepts up to 4096 prepared descriptors in one call. Every job
+still calls the complete validated `dg_solve`; errors are recorded per job,
+valid jobs still execute, and numerical operation order is unchanged. Writable
+outputs/workspaces must not overlap. Go's `NewBatch` pins request/output buffers
+using `runtime.Pinner`; always defer `Close`. Requests/scalars are captured at
+construction, array elements can be changed between calls and are revalidated.
+It is not safe to resize or concurrently mutate captured arrays. `Results` aliases
+owned buffers. Batch lifetime memory is larger than the reusable scalar solver.
+
+```sh
+# Root: export the IDENTICAL four-trajectory / 203-sample workload for Go.
+PYTHONPATH=src .venv-reference/bin/python native/acoustic/tools/verify.py --export-batch /tmp/real-batch.json
+/tmp/dg-acoustic -input /tmp/real-batch.json -repeat 100000 -dispatch scalar
+/tmp/dg-acoustic -input /tmp/real-batch.json -repeat 100000 -dispatch batch
+# Root: boundary comparison and equivalent-amortized-dispatch control.
+PYTHONPATH=src .venv-reference/bin/python native/acoustic/tools/verify.py --benchmark 20000
+PYTHONPATH=src .venv-reference/bin/python native/acoustic/tools/profile.py
+```
+
+Follow-up measurements, same shared host/dependencies, three alternating runs:
+
+| Python invocation (20,000 repetitions, same 4 trajectories) | Median wall s | Median CPU s |
+|---|---:|---:|
+| Existing native C extension, four calls/sweep | 0.442406 | 0.442383 |
+| Standalone ctypes scalar, four calls/sweep | 0.613749 | 0.613706 |
+| Standalone ctypes batch, one call/sweep | 0.439500 | 0.439474 |
+
+Batching reduces this ctypes adapter's elapsed time by **28.4%**, eliminating the
+observed integration regression; it is **not demonstrably faster than the existing
+extension**. The 0.7% median difference versus that extension is too small/noisy
+to call a win (batch run range 0.437049–0.464410 s). Cumulative same-process peak
+RSS was 136564 KiB for all three routes, not backend-specific memory.
+
+`profile.py` compiles the original unchanged C arithmetic into a diagnostic
+baseline with the same checked C ABI validation and original stack/heap workspace
+threshold. Its heap allocator is libc malloc/free, **not CPython PyMem**. It verifies
+all output bits before timing, then replays entire loops inside C so each mode
+crosses ctypes **once per 100,000 repetitions**, excluding Python buffer parsing,
+ctypes per-job dispatch and descriptor construction for every mode:
+
+| Matched C-loop control (100,000 repetitions) | Median wall s | Median CPU s |
+|---|---:|---:|
+| Original arithmetic + stack/heap workspace policy | 2.198448 | 2.198255 |
+| Standalone batched ABI | 2.198060 | 2.193698 |
+| Standalone scalar ABI, loop inside C | 2.156105 | 2.155992 |
+
+Cumulative same-process peak RSS: 136284 KiB. One standalone scalar observation
+was 2.561229 s; all runs are retained by the script. These controls show **no
+convincing algorithm/workspace speedup**. Scaling their time to 20,000 repetitions
+puts native computation/validation near 0.44 s: most of the *extra* 0.17 s of the
+original ctypes result comes from scalar language dispatch, not slower arithmetic.
+No validation or physics checks were removed for these measurements.
+
+Identical four-trajectory Go CLI workload, 100,000 repetitions, three alternating
+fresh processes: scalar median wall/CPU 2.235273/2.275683 s; batch
+2.270839/2.301991 s (about 1.6% slower wall). Median lifetime RSS was 12628 KiB for
+both. An earlier adapter build with unnecessary batch preparation in scalar mode
+showed a 5.2% batch slowdown; neither measurement demonstrates an improvement.
+Pinning/batch preparation, JSON and output are excluded from solver timing,
+but lifetime RSS includes them. **Scalar remains the CLI default**; batch is opt-in
+for integrations where amortizing a higher-overhead boundary demonstrably helps.
+No claim that cgo batching accelerates this workload.
+
+Follow-up checks: 14 Python native/reference/batch/CLI tests and 8 Go tests,
+including pinned batch lifecycle, per-call validation after input mutation,
+independent job status, bitwise output parity and zero warm batch Go allocations.
+The initial commit's full CI passed (including C++ compilation, Python 3.11/3.14
+installation/static checks, sdist and Docker). The follow-up adds C++-compiled
+library differential execution to CI; its outcome must be checked separately.
+
+Next useful migration boundary: caller-prepared candidate-scoring batches, only
+after profiling real search/refinement workloads. This pass justifies avoiding
+per-trajectory ctypes calls, **not** replacing the scientific stack or claiming
+an end-to-end win. Production pipeline/defaults remain unchanged.

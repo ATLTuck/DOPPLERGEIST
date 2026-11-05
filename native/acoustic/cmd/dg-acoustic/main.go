@@ -16,7 +16,11 @@ import (
 func run() error {
 	input := flag.String("input", "", "JSON request array")
 	repeat := flag.Int("repeat", 1, "repetitions excluding parsing/output")
+	dispatch := flag.String("dispatch", "scalar", "batch or scalar native dispatch")
 	flag.Parse()
+	if *dispatch != "batch" && *dispatch != "scalar" {
+		return fmt.Errorf("dispatch must be batch or scalar")
+	}
 	if *input == "" || *repeat < 1 || *repeat > 1000000 {
 		return fmt.Errorf("require -input and repeat 1..1000000")
 	}
@@ -51,15 +55,29 @@ func run() error {
 			return fmt.Errorf("request %d: %w", i, err)
 		}
 	}
+	var batch *acoustic.Batch
+	if *dispatch == "batch" {
+		batch, err = acoustic.NewBatch(requests)
+		if err != nil {
+			return err
+		}
+		defer batch.Close()
+	}
 	var a, b syscall.Rusage
 	if err = syscall.Getrusage(syscall.RUSAGE_SELF, &a); err != nil {
 		return err
 	}
 	start := time.Now()
 	for j := 0; j < *repeat; j++ {
-		for i := range requests {
-			if err = solver.Solve(&requests[i]); err != nil {
+		if *dispatch == "batch" {
+			if err = batch.Solve(); err != nil {
 				return err
+			}
+		} else {
+			for i := range requests {
+				if err = solver.Solve(&requests[i]); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -79,7 +97,7 @@ func run() error {
 		}
 		results = append(results, map[string]any{"factor": acoustic.JSONValues(solver.Factor), "emission": acoustic.JSONValues(solver.Emission), "distance": acoustic.JSONValues(solver.Distance)})
 	}
-	return json.NewEncoder(os.Stdout).Encode(map[string]any{"requests": len(requests), "repeats": *repeat, "wall_seconds": wall, "cpu_seconds": cpu(b) - cpu(a), "peak_rss_kib": b.Maxrss, "go_version": runtime.Version(), "results": results})
+	return json.NewEncoder(os.Stdout).Encode(map[string]any{"dispatch": *dispatch, "requests": len(requests), "repeats": *repeat, "wall_seconds": wall, "cpu_seconds": cpu(b) - cpu(a), "peak_rss_kib": b.Maxrss, "go_version": runtime.Version(), "results": results})
 }
 func main() {
 	if err := run(); err != nil {
