@@ -178,6 +178,14 @@ Searches depend on acoustic evidence, reliable recording-time information, suffi
 
 Optional native backends, reuse of acoustic calculations, and checkpointed search are implemented and measured. In one pinned bounded regional HTTP replay, optimizations reduced elapsed time from **62.03 seconds to 37.19 seconds (1.67×)** without changing the compared scientific outputs. This is a workload-specific result, not a general national-search runtime claim. See [measured performance and reproduction](docs/PERFORMANCE.md#measured-native-computation-and-bounded-reuse) and [data/search architecture](docs/DATA_AND_SCALE.md).
 
+### Experimental standalone / Go migration slice
+
+The fork adds a [standalone acoustic C ABI and Go batch/benchmark driver](native/acoustic/README.md).
+This is an opt-in, real-trajectory-tested component, not a full application port.
+The existing Python pipeline and default native backend are unchanged; no overall
+speedup or localization-accuracy improvement is claimed. Local C++ compilation
+remains unverified; this slice uses the tested C + Go fallback.
+
 ## Documentation and references
 
 - [Local upload workflow](docs/PRODUCT.md) — browser UI, API, job monitoring, limits, cancellation, and resume.
